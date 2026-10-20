@@ -1,0 +1,7 @@
+uploads/
+uploads-test/
+uploads-ci/
+node_modules/
+.env
+.env.test
+coverage/

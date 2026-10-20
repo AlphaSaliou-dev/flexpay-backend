@@ -1,0 +1,1473 @@
+openapi: 3.0.3
+info:
+  title: FlexPay API
+  version: "1.0.0"
+  description: |
+    API de FlexPay, portefeuille électronique consolidant mobile money et banque
+    pour la zone UEMOA (Guinée en premier marché). FlexPay n'a pas de licence EME
+    et n'accepte aucun dépôt ou retrait en espèces.
+
+    ## Deux publics distincts
+    - **App FlexPay** (`Authorization: Bearer <token>`) — utilisée par l'app mobile
+      officielle. Un développeur tiers n'a normalement pas besoin de ces routes.
+    - **API Partenaire B2B** (`x-api-key: <clé>`) — c'est CETTE section qui
+      intéresse un développeur externe qui veut accepter des paiements FlexPay
+      dans sa propre application (voir la section **Payments API (Partenaires)**
+      ci-dessous). Aucun paiement n'est jamais débité sans l'approbation
+      explicite de l'utilisateur final dans l'app FlexPay.
+
+    ## Environnements LIVE et TEST
+    Chaque clé API partenaire est rattachée à un environnement :
+    - **TEST** (préfixe `fp_test_`) — aucune donnée financière réelle n'est
+      jamais créée. N'importe quel numéro de téléphone est accepté, aucune
+      approbation utilisateur réelle n'est requise. Vous simulez vous-même
+      l'issue via `POST /payments/api/intents/{id}/test-resolve`. Générable
+      instantanément en libre-service dans l'app (compte Business validé requis),
+      sans validation admin.
+    - **LIVE** (préfixe `fp_live_`) — argent réel, création exclusivement par un
+      administrateur FlexPay après revue manuelle.
+
+    ## Idempotence
+    Toute opération qui déplace de l'argent (dépôt, retrait, transfert, création
+    d'intention de paiement) exige un `idempotencyKey` (UUID v4) généré côté
+    appelant. Rejouer le même appel avec la même clé renvoie le résultat déjà
+    obtenu sans dupliquer l'opération.
+
+    ## Pay-in vs Pay-out
+    - **Pay-in** (`/payments/api/intents`) — vous *demandez* à être payé. Le
+      payeur approuve explicitement dans l'app FlexPay (OTP inclus) ; aucun
+      paiement n'est jamais débité sans cette approbation.
+    - **Pay-out** (`/payments/api/payouts`) — vous *versez* de l'argent à un
+      utilisateur (rembourser un client, payer un livreur...), immédiatement et
+      sans approbation du bénéficiaire - recevoir de l'argent ne se confirme
+      jamais. Les fonds sortent du wallet FlexPay de votre compte Business.
+
+    ## Webhooks
+    Si vous configurez une URL de webhook (`PUT /payments/api-clients/{id}/webhook`),
+    FlexPay POST un événement signé à chaque résolution d'intention ou de versement :
+    ```
+    POST <votre_url>
+    X-FlexPay-Signature: sha256=<hmac_hex>
+    X-FlexPay-Event: payment_intent.approved | payment_intent.rejected | payout.completed | payout.failed
+    Content-Type: application/json
+
+    { "event": "payment_intent.approved", "data": { "intentId": "...", "amount": 50000, "transactionId": "..." }, "timestamp": "..." }
+    ```
+    Vérifiez la signature avec `HMAC-SHA256(corps_json, votre_secret_webhook)`.
+
+    **Fiabilité** : un échec de livraison est automatiquement réessayé à backoff
+    croissant (1 min, 5 min, 30 min, 2 h - 5 tentatives au total), puis abandonné
+    si le partenaire reste injoignable. Chaque tentative (succès, échec, ou
+    abandon définitif) reste consultable via `GET /payments/api/webhook-deliveries`
+    - jamais un échec silencieusement perdu comme auparavant.
+
+    ## Limite de débit
+    Les routes `/payments/api/*` sont limitées **par clé API** (jamais par
+    adresse IP - un partenaire fait généralement tous ses appels depuis un
+    même serveur) :
+    - **200 requêtes/minute** en environnement LIVE
+    - **400 requêtes/minute** en environnement TEST (plafond plus généreux pour
+      le développement itératif)
+
+    Au-delà, une réponse `429 Too Many Requests` est renvoyée. Chaque partenaire
+    a son propre quota, totalement indépendant des autres.
+
+    ## Sécurité de la clé API
+    Une clé API peut être configurée (par un admin, à la création) avec :
+    - **Une expiration** (`expiresAt`) — au-delà, la clé est refusée même si non révoquée.
+    - **Une liste d'adresses IP autorisées** (`allowedIps`) — si définie, seules
+      ces adresses peuvent authentifier avec cette clé. Vide par défaut = aucune
+      restriction (comportement historique préservé).
+
+  contact:
+    name: Support FlexPay
+    url: https://flexpay.gn
+
+servers:
+  - url: "{baseUrl}/api/v1"
+    variables:
+      baseUrl:
+        default: http://localhost:4000
+        description: Remplacer par PUBLIC_API_URL en production
+
+tags:
+  - name: Payments API (Partenaires)
+    description: "La véritable surface d'intégration pour un développeur tiers - clé API (x-api-key), jamais de token utilisateur."
+  - name: Auth
+    description: Inscription, connexion, sessions - utilisé par l'app FlexPay elle-même.
+  - name: Wallet
+    description: Dépôt, retrait, transfert, relevés - app FlexPay uniquement.
+  - name: Payments (App)
+    description: Paiement marchand in-app, personnalisation (champs/reçus) - app FlexPay + tableau de bord Business.
+  - name: Reçus
+    description: Téléchargement et vérification publique des reçus.
+  - name: KYC
+    description: Vérification d'identité (Particulier et Business).
+  - name: Carte virtuelle
+    description: Émission et gestion de la carte virtuelle.
+  - name: Paiement en masse
+    description: Versements groupés et listes de bénéficiaires (comptes Business).
+  - name: Liens de paiement
+    description: "Lien public réutilisable (montant fixe ou libre) pour être payé sans recherche de marchand - gestion (app/tableau de bord Business) et paiement public (sans authentification)."
+  - name: Marchands
+    description: Recherche de marchands et consultation de leurs champs personnalisés.
+  - name: Fichiers
+    description: Upload de documents (KYC, logos) avec scan antivirus.
+  - name: Notifications
+    description: Enregistrement du token de notification push.
+  - name: Admin
+    description: "Interne uniquement - console d'administration FlexPay, jamais destiné à un développeur tiers."
+  - name: Contact
+    description: "Formulaire de contact public (site vitrine ou app), sans compte requis."
+  - name: SMS hors ligne
+    description: "Webhook appelé par le fournisseur SMS à chaque SMS reçu sur le numéro FlexPay - commandes OTP/SOLDE/DEPOT/RETRAIT/ENVOI pour un utilisateur sans connexion internet."
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token de session utilisateur ou admin FlexPay.
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Clé API partenaire (fp_live_... ou fp_test_...).
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Solde insuffisant"
+
+    PaymentIntent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        apiClientId: { type: string, format: uuid }
+        environment: { type: string, enum: [LIVE, TEST] }
+        payerUserId: { type: string, format: uuid, nullable: true, description: "null en environnement TEST" }
+        payerPhone: { type: string, example: "+224620000000" }
+        amount: { type: number, example: 50000 }
+        reference: { type: string, nullable: true }
+        idempotencyKey: { type: string, format: uuid }
+        status: { type: string, enum: [PENDING_APPROVAL, APPROVED, REJECTED, EXPIRED, CANCELLED] }
+        transactionId: { type: string, nullable: true, description: "préfixé test_tx_ en environnement TEST" }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+
+    ApiPayout:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        apiClientId: { type: string, format: uuid }
+        environment: { type: string, enum: [LIVE, TEST] }
+        recipientPhone: { type: string, example: "+224620000000" }
+        recipientUserId: { type: string, format: uuid, nullable: true, description: "null en environnement TEST" }
+        amount: { type: number, example: 50000 }
+        reference: { type: string, nullable: true }
+        idempotencyKey: { type: string, format: uuid }
+        status: { type: string, enum: [COMPLETED, FAILED] }
+        transactionId: { type: string, nullable: true, description: "préfixé test_tx_ en environnement TEST" }
+        failureReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        event: { type: string, example: "payment_intent.approved" }
+        status: { type: string, enum: [PENDING, DELIVERED, FAILED] }
+        attempts: { type: integer }
+        lastError: { type: string, nullable: true }
+        nextRetryAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        deliveredAt: { type: string, format: date-time, nullable: true }
+
+    PaymentField:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string, example: "Nom de l'élève" }
+        fieldKey: { type: string, example: "nom_de_l_eleve" }
+        required: { type: boolean }
+        order: { type: integer }
+
+paths:
+  /payments/api/intents:
+    post:
+      tags: [Payments API (Partenaires)]
+      summary: Créer une intention de paiement
+      description: |
+        Le client final devra approuver lui-même cette demande dans l'app FlexPay
+        avec son propre code de vérification. Vous ne pouvez jamais débiter un
+        compte directement.
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payerPhone, amount, idempotencyKey]
+              properties:
+                payerPhone: { type: string, example: "+224620000000", description: "N'importe quel numéro en environnement TEST" }
+                amount: { type: number, example: 50000 }
+                reference: { type: string, maxLength: 200, example: "Commande #1234" }
+                idempotencyKey: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Intention créée (ou déjà existante si idempotencyKey rejouée)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentIntent' }
+        '404':
+          description: Numéro payeur introuvable ou inactif (environnement LIVE uniquement)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: "Trop de requêtes pour cette clé API (200/min en LIVE, 400/min en TEST)"
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    get:
+      tags: [Payments API (Partenaires)]
+      summary: Lister mes intentions de paiement
+      description: >
+        Manquait jusqu'ici : seule une consultation par id déjà connu était
+        possible. Permet une vraie réconciliation côté partenaire.
+      security: [{ ApiKeyAuth: [] }]
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [PENDING_APPROVAL, APPROVED, REJECTED, EXPIRED, CANCELLED] } }
+        - { name: page, in: query, required: false, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: Liste paginée de vos intentions, la plus récente en premier
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PaymentIntent' } }
+                  pagination: { type: object, properties: { page: { type: integer }, pageSize: { type: integer }, total: { type: integer }, totalPages: { type: integer } } }
+
+  /payments/api/intents/{id}:
+    get:
+      tags: [Payments API (Partenaires)]
+      summary: Consulter le statut d'une intention
+      security: [{ ApiKeyAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: État actuel de l'intention
+          content: { application/json: { schema: { $ref: '#/components/schemas/PaymentIntent' } } }
+        '404':
+          description: Intention introuvable ou n'appartenant pas à votre clé
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /payments/api/intents/{id}/cancel:
+    post:
+      tags: [Payments API (Partenaires)]
+      summary: Annuler une intention encore en attente
+      description: >
+        Action du PARTENAIRE (distincte du rejet, qui est l'action du payeur) -
+        utile si la commande associée est annulée avant toute réponse de
+        l'utilisateur. Impossible sur une intention déjà résolue.
+      security: [{ ApiKeyAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Intention annulée
+          content: { application/json: { schema: { $ref: '#/components/schemas/PaymentIntent' } } }
+        '404':
+          description: Intention introuvable ou n'appartenant pas à votre clé
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: "L'intention n'est plus en attente (déjà résolue)"
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /payments/api/intents/{id}/test-resolve:
+    post:
+      tags: [Payments API (Partenaires)]
+      summary: "[TEST uniquement] Simuler l'approbation ou le rejet"
+      description: |
+        Réservé aux clés en environnement TEST. Permet de tester les deux chemins
+        de votre intégration (succès et échec) sans dépendre d'un vrai utilisateur.
+        Rejeté sur une intention LIVE, quelle que soit la clé utilisée.
+      security: [{ ApiKeyAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              properties:
+                outcome: { type: string, enum: [APPROVED, REJECTED] }
+      responses:
+        '200':
+          description: Intention résolue
+          content: { application/json: { schema: { $ref: '#/components/schemas/PaymentIntent' } } }
+        '403':
+          description: Cette route ne peut être utilisée que sur une intention en environnement TEST
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: Cette intention n'est plus en attente
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /payments/api/payouts:
+    post:
+      tags: [Payments API (Partenaires)]
+      summary: "Verser de l'argent à un utilisateur (pay-out)"
+      description: >
+        Contrairement à une intention (pay-in), aucune approbation n'est requise
+        côté bénéficiaire - les fonds sortent immédiatement du wallet FlexPay de
+        votre compte Business. En environnement TEST, forceOutcome permet de
+        simuler volontairement un échec pour tester votre propre gestion d'erreur.
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipientPhone, amount, idempotencyKey]
+              properties:
+                recipientPhone: { type: string, example: "+224620000000", description: "N'importe quel numéro en environnement TEST" }
+                amount: { type: number, example: 50000 }
+                reference: { type: string, maxLength: 200 }
+                idempotencyKey: { type: string, format: uuid }
+                forceOutcome: { type: string, enum: [COMPLETED, FAILED], description: "TEST uniquement - ignoré en LIVE" }
+      responses:
+        '200':
+          description: Versement effectué (ou déjà existant si idempotencyKey rejouée)
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiPayout' } } }
+        '400':
+          description: "Solde insuffisant (frais inclus) pour ce versement"
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: Bénéficiaire introuvable ou inactif (environnement LIVE uniquement)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    get:
+      tags: [Payments API (Partenaires)]
+      summary: Lister mes versements
+      security: [{ ApiKeyAuth: [] }]
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [COMPLETED, FAILED] } }
+        - { name: page, in: query, required: false, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: Liste paginée de vos versements, le plus récent en premier
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ApiPayout' } }
+                  pagination: { type: object, properties: { page: { type: integer }, pageSize: { type: integer }, total: { type: integer }, totalPages: { type: integer } } }
+
+  /payments/api/payouts/{id}:
+    get:
+      tags: [Payments API (Partenaires)]
+      summary: Consulter le statut d'un versement
+      security: [{ ApiKeyAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: État actuel du versement
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiPayout' } } }
+        '404':
+          description: Versement introuvable ou n'appartenant pas à votre clé
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /payments/api/webhook-deliveries:
+    get:
+      tags: [Payments API (Partenaires)]
+      summary: Historique de livraison de mes webhooks
+      description: >
+        Visibilité sur chaque tentative (succès, échec, réessai programmé, ou
+        abandon définitif après 5 tentatives) - permet de diagnostiquer un
+        webhook qui semble ne jamais arriver sans avoir à contacter le support.
+      security: [{ ApiKeyAuth: [] }]
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [PENDING, DELIVERED, FAILED] } }
+        - { name: page, in: query, required: false, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: Liste paginée des tentatives de livraison, la plus récente en premier
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/WebhookDelivery' } }
+                  pagination: { type: object, properties: { page: { type: integer }, pageSize: { type: integer }, total: { type: integer }, totalPages: { type: integer } } }
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Créer un compte (déclenche l'envoi d'un code SMS)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, password]
+              properties:
+                phone: { type: string, example: "+224620000000" }
+                password: { type: string, minLength: 8 }
+                fullName: { type: string }
+                declaresCommercialUse: { type: boolean, default: false }
+      responses:
+        '200': { description: Compte créé, en attente de vérification OTP }
+
+  /auth/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Vérifier le code SMS reçu à l'inscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone: { type: string }
+                code: { type: string, minLength: 6, maxLength: 6 }
+      responses:
+        '200': { description: Numéro vérifié }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Connexion (téléphone + mot de passe)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, password]
+              properties:
+                phone: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: Connexion réussie
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken: { type: string }
+                  refreshToken: { type: string }
+                  user: { type: object, properties: { id: { type: string }, phone: { type: string } } }
+        '401':
+          description: Identifiants invalides (même message que compte inexistant, anti-énumération)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Renouveler un token d'accès expiré
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties: { refreshToken: { type: string } }
+      responses:
+        '200': { description: Nouveau couple access/refresh token }
+
+  /auth/sessions:
+    get:
+      tags: [Auth]
+      summary: Lister mes sessions actives (appareils connectés)
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Liste des sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    userAgent: { type: string, nullable: true }
+                    ipAddress: { type: string, nullable: true }
+                    createdAt: { type: string, format: date-time }
+
+  /auth/sessions/{id}:
+    delete:
+      tags: [Auth]
+      summary: "Déconnecter une session précise (ex: téléphone volé)"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Session révoquée }
+        '404':
+          description: Session introuvable
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /auth/profile:
+    get:
+      tags: [Auth]
+      summary: Consulter mon profil (id, téléphone, nom complet)
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Profil actuel } }
+    put:
+      tags: [Auth]
+      summary: "Modifier mon profil (nom complet uniquement)"
+      description: "Le téléphone reste l'identifiant immuable du compte, jamais modifiable ici."
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fullName]
+              properties: { fullName: { type: string, minLength: 2, maxLength: 100 } }
+      responses: { '200': { description: Profil mis à jour } }
+
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Changer son mot de passe (révoque toutes les sessions actives)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword, otpCode]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string, minLength: 8 }
+                otpCode: { type: string, description: "Obtenu via POST /auth/sensitive-otp/request" }
+      responses:
+        '200': { description: Mot de passe changé }
+
+  /auth/transaction-pin/status:
+    get:
+      tags: [Auth]
+      summary: Savoir si le code PIN de transaction est déjà défini
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { isSet: { type: boolean } } }
+
+  /auth/transaction-pin:
+    put:
+      tags: [Auth]
+      summary: Définir ou changer le code PIN de transaction
+      description: >-
+        Remplace l'OTP par SMS pour les actions sensibles fréquentes
+        (retrait, transfert, carte, paiement marchand...) - voir
+        requireTransactionPin. Première définition : aucune preuve
+        supplémentaire requise (compte déjà authentifié). Changement d'un
+        PIN existant : `currentPin` obligatoire, vérifié avec le même
+        verrouillage progressif qu'une vraie transaction.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pin]
+              properties:
+                currentPin: { type: string, pattern: '^\d{4}$|^\d{6}$', description: "Requis uniquement si un PIN est déjà défini" }
+                pin: { type: string, pattern: '^\d{4}$|^\d{6}$', description: "Nouveau code PIN (4 ou 6 chiffres)" }
+      responses:
+        '200': { description: Code PIN défini }
+        '400': { description: "currentPin manquant alors qu'un PIN existe déjà" }
+        '401': { description: Code PIN actuel incorrect }
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Demander un code de récupération de compte
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [phone], properties: { phone: { type: string } } }
+      responses:
+        '200': { description: "Toujours { sent: true }, même pour un numéro inexistant (anti-énumération)" }
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Réinitialiser le mot de passe avec le code reçu
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code, newPassword]
+              properties:
+                phone: { type: string }
+                code: { type: string }
+                newPassword: { type: string, minLength: 8 }
+      responses:
+        '200': { description: Mot de passe réinitialisé, sessions révoquées }
+
+  /wallet/balance:
+    get:
+      tags: [Wallet]
+      summary: Consulter mon solde
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Solde actuel
+          content: { application/json: { schema: { type: object, properties: { balance: { type: number } } } } }
+
+  /wallet/history:
+    get:
+      tags: [Wallet]
+      summary: Historique des opérations
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Liste paginée des transactions }
+
+  /wallet/statement.csv:
+    get:
+      tags: [Wallet]
+      summary: Télécharger le relevé au format CSV
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Fichier CSV
+          content: { text/csv: { schema: { type: string, format: binary } } }
+
+  /wallet/statement.pdf:
+    get:
+      tags: [Wallet]
+      summary: Télécharger le relevé au format PDF
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Fichier PDF
+          content: { application/pdf: { schema: { type: string, format: binary } } }
+
+  /wallet/deposit:
+    post:
+      tags: [Wallet]
+      summary: Déposer des fonds (mobile money)
+      description: >-
+        Aucune référence externe n'est acceptée du client : le serveur
+        interroge lui-même l'opérateur (via la même abstraction que les
+        paiements entrants) avec le numéro réel du compte, et ne crédite
+        que si cet appel confirme le débit. `bank` est accepté par le
+        schéma mais refusé (400) : les dépôts bancaires ne sont pas encore
+        disponibles.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, idempotencyKey, provider]
+              properties:
+                amount: { type: number }
+                idempotencyKey: { type: string, format: uuid }
+                provider: { type: string, enum: [orange_money, mtn_momo, bank] }
+      responses:
+        '200': { description: Dépôt effectué }
+        '400': { description: Montant invalide, ou provider "bank" (pas encore disponible) }
+        '402': { description: Le fournisseur externe n'a pas confirmé le dépôt }
+
+  /wallet/withdraw:
+    post:
+      tags: [Wallet]
+      summary: Retirer des fonds (mobile money)
+      description: >-
+        Aucune référence externe n'est acceptée du client : le serveur
+        demande lui-même le versement réel auprès de l'opérateur (payout(),
+        numéro réel du compte) et ne débite le wallet FlexPay qu'après
+        confirmation. `bank` est accepté par le schéma mais refusé (400) :
+        les retraits bancaires ne sont pas encore disponibles.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, idempotencyKey, provider, pinCode]
+              properties:
+                amount: { type: number }
+                idempotencyKey: { type: string, format: uuid }
+                provider: { type: string, enum: [orange_money, mtn_momo, bank] }
+                pinCode: { type: string }
+      responses:
+        '200': { description: Retrait effectué }
+        '400': { description: Montant invalide, solde insuffisant, ou provider "bank" (pas encore disponible) }
+        '402': { description: Le fournisseur externe n'a pas confirmé le versement }
+
+  /wallet/transfer:
+    post:
+      tags: [Wallet]
+      summary: Transférer des fonds à un autre utilisateur FlexPay
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toPhone, amount, idempotencyKey, pinCode]
+              properties:
+                toPhone: { type: string }
+                amount: { type: number }
+                idempotencyKey: { type: string, format: uuid }
+                pinCode: { type: string }
+      responses:
+        '200': { description: Transfert effectué }
+
+  /payments/pay:
+    post:
+      tags: [Payments (App)]
+      summary: Payer un marchand (in-app)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [businessUserId, amount, idempotencyKey, pinCode]
+              properties:
+                businessUserId: { type: string, format: uuid }
+                amount: { type: number }
+                idempotencyKey: { type: string, format: uuid }
+                reference: { type: string }
+                customFields:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: "Valeurs pour les champs définis par ce marchand (voir GET /merchants/{id}/payment-fields)"
+                pinCode: { type: string }
+      responses:
+        '200': { description: Paiement effectué }
+
+  /payments/business-fields:
+    get:
+      tags: [Payments (App)]
+      summary: Lister mes champs de paiement personnalisés (compte Business)
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Mes champs
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PaymentField' } } } }
+    post:
+      tags: [Payments (App)]
+      summary: Créer un champ personnalisé (max 10 par compte)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              properties:
+                label: { type: string, example: "Nom de l'élève" }
+                required: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Champ créé
+          content: { application/json: { schema: { $ref: '#/components/schemas/PaymentField' } } }
+
+  /payments/business-fields/{id}:
+    put:
+      tags: [Payments (App)]
+      summary: Modifier un champ personnalisé
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Champ mis à jour } }
+    delete:
+      tags: [Payments (App)]
+      summary: Supprimer un champ personnalisé
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Champ supprimé } }
+
+  /payments/receipt-branding:
+    put:
+      tags: [Payments (App)]
+      summary: Personnaliser le reçu (logo + pied de page)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                receiptLogoUrl: { type: string, format: uri, description: "Obtenu via POST /files (purpose=BUSINESS_RECEIPT_LOGO)" }
+                receiptFooterText: { type: string, maxLength: 500 }
+      responses: { '200': { description: Personnalisation enregistrée } }
+
+  /payments/received:
+    get:
+      tags: [Payments (App)]
+      summary: Tableau de bord des paiements reçus (compte Business)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 20 } }
+      responses: { '200': { description: Liste paginée avec champs personnalisés inline } }
+
+  /payments/api-status:
+    get:
+      tags: [Payments (App)]
+      summary: Statut de mes clés API (LIVE et/ou TEST)
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: "Jamais le hash ni la clé complète, juste le préfixe" } }
+
+  /payments/api-clients/self-service-test-key:
+    post:
+      tags: [Payments (App)]
+      summary: Générer ma clé de TEST en libre-service (compte Business validé requis)
+      description: Instantané, sans validation admin - aucun risque, une clé TEST ne touche jamais de vrai argent.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: "Clé révélée UNE SEULE FOIS dans la réponse - jamais récupérable ensuite" }
+        '409': { description: Une clé de test existe déjà pour ce compte }
+
+  /payments/api-clients/{id}/webhook:
+    put:
+      tags: [Payments (App)]
+      summary: Configurer l'URL de webhook de ma clé API
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [webhookUrl], properties: { webhookUrl: { type: string, format: uri } } }
+      responses:
+        '200': { description: "Le secret de signature n'est révélé qu'à la toute première configuration, jamais relu ensuite" }
+
+  /payments/api-clients/{id}/webhook/regenerate-secret:
+    post:
+      tags: [Payments (App)]
+      summary: Régénérer le secret de signature du webhook
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Nouveau secret révélé une seule fois } }
+
+  /payments/receipts/{transactionId}/download-link:
+    post:
+      tags: [Reçus]
+      summary: Obtenir un lien de téléchargement à courte durée de vie (5 min)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: transactionId, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Token limité à ce seul reçu } }
+
+  /payments/receipts/{transactionId}:
+    get:
+      tags: [Reçus]
+      summary: Télécharger le reçu PDF (avec QR de vérification)
+      description: |
+        Accepte soit un header Authorization Bearer classique, soit un paramètre
+        ?token= obtenu via POST .../download-link (pensé pour une ouverture
+        directe dans un navigateur/lecteur PDF externe).
+      parameters:
+        - { name: transactionId, in: path, required: true, schema: { type: string } }
+        - { name: token, in: query, required: false, schema: { type: string } }
+      responses:
+        '200':
+          description: Fichier PDF
+          content: { application/pdf: { schema: { type: string, format: binary } } }
+        '404': { description: Reçu introuvable ou vous n'y avez pas accès }
+
+  /payments/receipts/{transactionId}/verify:
+    get:
+      tags: [Reçus]
+      summary: Page de vérification publique (scannée via le QR du reçu)
+      description: |
+        Aucune authentification. Volontairement minimal : confirme l'authenticité
+        sans jamais exposer le numéro du payeur ni les champs personnalisés.
+      parameters: [{ name: transactionId, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: Page HTML de confirmation
+          content: { text/html: { schema: { type: string } } }
+        '404': { description: Page HTML "reçu introuvable" }
+
+  /kyc/status:
+    get:
+      tags: [KYC]
+      summary: Mon statut de vérification actuel
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Palier, type de compte, statut de revue } }
+
+  /kyc/tier1:
+    post:
+      tags: [KYC]
+      summary: "Palier 1 - identité déclarative"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fullName, dateOfBirth]
+              properties: { fullName: { type: string }, dateOfBirth: { type: string, format: date } }
+      responses: { '200': { description: Palier 1 atteint } }
+
+  /kyc/tier2:
+    post:
+      tags: [KYC]
+      summary: "Palier 2 - pièce d'identité + selfie"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idDocumentType, idDocumentNumber, idDocumentUrl, selfieUrl]
+              properties:
+                idDocumentType: { type: string, enum: [CNI, PASSEPORT, PERMIS_CONDUIRE, CARTE_ELECTEUR] }
+                idDocumentNumber: { type: string }
+                idDocumentUrl: { type: string, format: uri, description: "Obtenu via POST /files (purpose=KYC_ID_DOCUMENT)" }
+                selfieUrl: { type: string, format: uri, description: "Obtenu via POST /files (purpose=KYC_SELFIE)" }
+      responses: { '200': { description: Soumis, en attente de revue manuelle } }
+
+  /kyc/business:
+    post:
+      tags: [KYC]
+      summary: "KYB - créer/mettre à jour un compte Business (avec bénéficiaires effectifs)"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [businessName, rccmNumber, nifNumber, legalRepName, legalRepIdDocumentUrl, businessDocumentUrl, ubos]
+              properties:
+                businessName: { type: string }
+                rccmNumber: { type: string }
+                nifNumber: { type: string }
+                legalRepName: { type: string }
+                legalRepIdDocumentUrl: { type: string, format: uri }
+                businessDocumentUrl: { type: string, format: uri }
+                category: { type: string, description: "Affichée dans le catalogue public des marchands (optionnel)" }
+                location: { type: string, description: "Affichée dans le catalogue public des marchands (optionnel)" }
+                ubos:
+                  type: array
+                  minItems: 1
+                  description: "Au moins un bénéficiaire effectif requis"
+                  items:
+                    type: object
+                    properties:
+                      fullName: { type: string }
+                      ownershipPercentage: { type: number }
+                      idDocumentUrl: { type: string, format: uri }
+      responses: { '200': { description: Soumis, en attente de revue manuelle } }
+
+  /virtual-card:
+    post:
+      tags: [Carte virtuelle]
+      summary: Émettre ma carte virtuelle (palier 2 requis)
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Carte émise } }
+    get:
+      tags: [Carte virtuelle]
+      summary: Consulter ma carte
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Détails de la carte } }
+
+  /virtual-card/topup:
+    post:
+      tags: [Carte virtuelle]
+      summary: Recharger la carte depuis mon wallet
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [amount, pinCode], properties: { amount: { type: number }, pinCode: { type: string } } }
+      responses: { '200': { description: "Carte rechargée (frais de 2,5%)" } }
+
+  /virtual-card/freeze:
+    post:
+      tags: [Carte virtuelle]
+      summary: Geler ma carte (jamais bloqué par OTP - toujours sûr)
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Carte gelée } }
+
+  /virtual-card/unfreeze:
+    post:
+      tags: [Carte virtuelle]
+      summary: Dégeler ma carte (OTP requis - redonne la capacité de dépenser)
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Carte dégelée } }
+
+  /bulk-payout:
+    post:
+      tags: [Paiement en masse]
+      summary: Créer un lot de paiements groupés
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items, idempotencyKey, pinCode]
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    properties: { phone: { type: string }, amount: { type: number }, reference: { type: string } }
+                reference: { type: string }
+                idempotencyKey: { type: string, format: uuid }
+                pinCode: { type: string }
+      responses: { '200': { description: Lot traité (chaque ligne indépendamment) } }
+    get:
+      tags: [Paiement en masse]
+      summary: Historique de mes lots
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Liste des lots } }
+
+  /bulk-payout/{id}:
+    get:
+      tags: [Paiement en masse]
+      summary: Détail d'un lot (ligne par ligne)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Détail complet } }
+
+  /bulk-payout/{id}/retry:
+    post:
+      tags: [Paiement en masse]
+      summary: Renvoyer les lignes en échec d'un lot
+      description: >
+        Sans itemIds, renvoie TOUTES les lignes en échec du lot. Avec
+        itemIds, ne renvoie que les lignes précisées (sélection dans le
+        tableau de bord) - un id qui ne correspond pas à une ligne FAILED de
+        ce lot est simplement ignoré.
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pinCode]
+              properties:
+                pinCode: { type: string }
+                externalPayoutMethod: { type: string, enum: [orange_money, mtn_momo, card], description: "Repli pour un bénéficiaire toujours sans compte FlexPay" }
+                itemIds: { type: array, items: { type: string, format: uuid }, description: "Sous-ensemble précis des lignes en échec à renvoyer" }
+      responses: { '200': { description: Lignes en échec rejouées } }
+
+  /bulk-payout/groups:
+    get:
+      tags: [Paiement en masse]
+      summary: Lister mes listes de bénéficiaires sauvegardées
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Liste des groupes } }
+    post:
+      tags: [Paiement en masse]
+      summary: Créer une liste de bénéficiaires
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Liste créée } }
+
+  /bulk-payout/groups/{id}:
+    get:
+      tags: [Paiement en masse]
+      summary: "Détail d'une liste"
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Détail } }
+    put:
+      tags: [Paiement en masse]
+      summary: "Remplacer les membres d'une liste"
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Liste mise à jour } }
+    delete:
+      tags: [Paiement en masse]
+      summary: Supprimer une liste
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Liste supprimée } }
+
+  /merchants:
+    get:
+      tags: [Marchands]
+      summary: "Catalogue des marchands validés KYB (sans terme de recherche requis)"
+      description: >
+        Complète /merchants/search pour un usage "catalogue parcourable" plutôt que
+        recherche par nom exact. Filtre optionnel par catégorie.
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: category, in: query, required: false, schema: { type: string } }]
+      responses: { '200': { description: "Liste des marchands (nom, id, logo, catégorie, localisation)" } }
+
+  /merchants/search:
+    get:
+      tags: [Marchands]
+      summary: Rechercher un marchand par nom
+      description: "Renvoie nom, id, logo (receiptLogoUrl), catégorie et localisation - jamais RCCM/NIF."
+      parameters: [{ name: q, in: query, required: true, schema: { type: string, minLength: 2 } }]
+      responses: { '200': { description: Liste des marchands correspondants } }
+
+  /merchants/{businessUserId}/payment-fields:
+    get:
+      tags: [Marchands]
+      summary: Champs personnalisés demandés par ce marchand
+      description: Consultation publique - nécessaire avant de soumettre un paiement avec customFields.
+      parameters: [{ name: businessUserId, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: Liste des champs (vide si le compte n'est pas encore validé)
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PaymentField' } } } }
+
+  /payment-links:
+    post:
+      tags: [Liens de paiement]
+      summary: Créer un lien de paiement partageable (réseaux sociaux, WhatsApp...)
+      description: >
+        Réservé aux comptes Business validés KYB. Le lien est réutilisable par défaut
+        (plusieurs acheteurs différents peuvent payer le même lien) - à montant fixe
+        (`amount` fourni) ou à montant libre choisi par le payeur (`amount` omis).
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              properties:
+                label: { type: string, example: "Robe wax - Taille M" }
+                amount: { type: number, description: "Omis = montant libre choisi par le payeur" }
+                expiresAt: { type: string, format: date-time }
+      responses: { '200': { description: Lien créé, avec son code public } }
+    get:
+      tags: [Liens de paiement]
+      summary: Lister mes liens de paiement
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Liste des liens de ce compte Business } }
+
+  /payment-links/{id}/toggle:
+    post:
+      tags: [Liens de paiement]
+      summary: Activer ou désactiver un de mes liens de paiement
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [active], properties: { active: { type: boolean } } } } }
+      responses:
+        '200': { description: Lien mis à jour }
+        '404': { description: "Lien introuvable (id inexistant OU appartenant à une autre entreprise - même message)" }
+
+  /payment-links/public/{code}:
+    get:
+      tags: [Liens de paiement]
+      summary: Consulter un lien de paiement (public, sans authentification)
+      description: >
+        Ce que voit le payeur avant même de se connecter, en cliquant le lien partagé
+        sur les réseaux sociaux : le nom du marchand, ce qui est vendu, le montant
+        (ou `null` si libre), le statut (ACTIVE, INACTIVE ou EXPIRED), et les champs
+        personnalisés (customFields) que l'institution demande, le cas échéant.
+      parameters: [{ name: code, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Informations publiques du lien }
+        '404': { description: Code inconnu }
+
+  /payment-links/public/{code}/pay:
+    post:
+      tags: [Liens de paiement]
+      summary: Payer un lien (flux OTP en 2 temps, comme tout paiement marchand)
+      description: >
+        Le payeur doit être connecté. Sur un lien à montant fixe, le montant envoyé
+        ici est ignoré - c'est toujours celui du lien qui s'applique, pour qu'un
+        client ne puisse jamais altérer le prix affiché.
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: code, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idempotencyKey, pinCode]
+              properties:
+                amount: { type: number, description: "Requis uniquement si le lien est à montant libre" }
+                idempotencyKey: { type: string, format: uuid }
+                customFields:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: "Valeurs pour les champs définis par l'institution (voir customFields dans GET public/{code})"
+                pinCode: { type: string, pattern: '^\d{4}$|^\d{6}$', description: "Code PIN de transaction (4 ou 6 chiffres)" }
+      responses:
+        '200': { description: Paiement effectué }
+        '410': { description: Lien désactivé ou expiré }
+
+  /files:
+    post:
+      tags: [Fichiers]
+      summary: Uploader un document (scan antivirus systématique)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties: { file: { type: string, format: binary } }
+      parameters:
+        - name: purpose
+          in: query
+          required: true
+          schema: { type: string, enum: [KYC_ID_DOCUMENT, KYC_SELFIE, KYB_LEGAL_REP_ID, KYB_BUSINESS_DOCUMENT, KYB_UBO_ID_DOCUMENT, BUSINESS_RECEIPT_LOGO] }
+      responses:
+        '201': { description: "Fichier accepté - réponse : { fileId, url }" }
+        '422':
+          description: Signature virale détectée
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /files/{id}:
+    get:
+      tags: [Fichiers]
+      summary: Récupérer un fichier (propriétaire uniquement)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Contenu du fichier } }
+
+  /notifications/push-token:
+    put:
+      tags: [Notifications]
+      summary: Enregistrer mon token de notification push (Expo)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [token], properties: { token: { type: string, example: "ExponentPushToken[...]" } } }
+      responses: { '200': { description: Token enregistré } }
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: "Mon journal de notifications (historique consultable, distinct du simple envoi push/SMS)"
+      description: >
+        Toujours créée à chaque évènement notifiable, même si l'utilisateur a désactivé
+        la catégorie correspondante dans ses préférences - désactiver le push ne fait
+        jamais disparaître l'évènement de ce journal.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: "Liste des notifications, la plus récente en premier"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    type: { type: string, example: "PAYMENT_RECEIVED" }
+                    title: { type: string }
+                    body: { type: string }
+                    data: { type: object, nullable: true }
+                    readAt: { type: string, format: date-time, nullable: true }
+                    createdAt: { type: string, format: date-time }
+
+  /notifications/{id}/read:
+    post:
+      tags: [Notifications]
+      summary: Marquer une notification comme lue
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Notification marquée comme lue }
+        '404':
+          description: "Notification introuvable (id inexistant OU appartenant à un autre utilisateur - même message)"
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Marquer toutes mes notifications comme lues
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Toutes les notifications non lues sont marquées lues } }
+
+  /notifications/preferences:
+    get:
+      tags: [Notifications]
+      summary: Consulter mes préférences de notification
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: "Préférences actuelles"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifyOnTransactions: { type: boolean, description: "Dépôts, retraits, transferts, paiements, KYC/KYB" }
+                  notifyOnPaymentRequests: { type: boolean, description: "Demandes de paiement B2B en attente d'approbation" }
+    put:
+      tags: [Notifications]
+      summary: Modifier mes préférences de notification
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notifyOnTransactions: { type: boolean }
+                notifyOnPaymentRequests: { type: boolean }
+      responses: { '200': { description: Préférences mises à jour } }
+
+  /admin/login:
+    post:
+      tags: [Admin]
+      summary: "Connexion admin (première étape, 2FA TOTP requis ensuite)"
+      responses: { '200': { description: Session complète ou setupRequired/totpRequired } }
+
+  /admin/payment-fields:
+    get:
+      tags: [Admin]
+      summary: Lister tous les champs personnalisés de toutes les institutions (modération)
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Liste paginée avec nom de l'institution } }
+
+  /admin/payment-fields/{id}:
+    delete:
+      tags: [Admin]
+      summary: Supprimer de force un champ (libellé inapproprié)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Champ supprimé, action journalisée } }
+
+  /contact:
+    post:
+      tags: [Contact]
+      summary: Envoyer un message au support
+      description: >
+        Public - aucune authentification requise, un visiteur du site vitrine
+        sans compte doit pouvoir écrire. Si un jeton Bearer valide est tout de
+        même fourni (cas de l'app), le message est automatiquement rattaché au
+        compte correspondant, sinon il reste anonyme sans bloquer l'envoi.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fullName, contactInfo, subject, message, source]
+              properties:
+                fullName: { type: string, minLength: 2, maxLength: 120 }
+                contactInfo: { type: string, minLength: 5, maxLength: 120, description: "Email ou téléphone, au choix de l'expéditeur" }
+                subject: { type: string, minLength: 2, maxLength: 150 }
+                message: { type: string, minLength: 10, maxLength: 2000 }
+                source: { type: string, enum: [landing, app] }
+      responses:
+        '200':
+          description: Message reçu
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean }
+                  id: { type: string, format: uuid }
+                  createdAt: { type: string, format: date-time }
+        '429':
+          description: "Trop de messages envoyés depuis cette adresse IP (5 par 10 minutes)"
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /sms-commands/inbound:
+    post:
+      tags: [SMS hors ligne]
+      summary: Webhook - SMS reçu par le fournisseur sur le numéro FlexPay
+      description: >
+        Appelé par le fournisseur SMS (pas par l'app ni l'utilisateur), à
+        chaque SMS reçu. Authentifié par un secret partagé en en-tête
+        (`x-sms-webhook-secret`), jamais par un jeton utilisateur - il n'y a
+        pas de session, l'utilisateur est identifié par le numéro expéditeur
+        (`from`). Commandes supportées dans `text` (premier mot) : `OTP`
+        (demande un code), `SOLDE <code>`, `DEPOT <montant> <moyen> <code>`,
+        `RETRAIT <montant> <moyen> <code>`, `ENVOI <montant>
+        <référence_ou_numéro> <code>`. `moyen` = orange_money ou mtn_momo.
+        Le destinataire d'un ENVOI peut être soit la référence opaque à 6
+        chiffres du compte (jamais son vrai numéro, voir GET
+        /wallet/recipient-lookup qui la renvoie), soit un numéro réel en
+        clair pour un tout premier contact jamais mis en cache. Répond
+        toujours 200 (sauf requête malformée) - le résultat réel part par un
+        SMS séparé vers l'expéditeur, jamais dans la réponse HTTP.
+      security: []
+      parameters:
+        - { name: x-sms-webhook-secret, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, text]
+              properties:
+                from: { type: string, description: "Numéro E.164 de l'expéditeur, ex +224620000000" }
+                text: { type: string, description: "Contenu brut du SMS reçu" }
+                messageId:
+                  type: string
+                  description: >-
+                    Identifiant unique du message côté fournisseur, si
+                    disponible - utilisé pour dériver une clé d'idempotence
+                    stable (un webhook rejoué ne redéclenche jamais un
+                    second mouvement d'argent). Repli sur un identifiant
+                    aléatoire par appel si absent.
+      responses:
+        '200': { description: "SMS traité (le résultat part par SMS séparé)" }
+        '400': { description: "from ou text manquant" }
+        '401': { description: "Secret de webhook invalide ou manquant" }

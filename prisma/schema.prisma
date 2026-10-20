@@ -1,0 +1,1019 @@
+// FlexPay - schéma PostgreSQL
+// Le coeur identité + ledger reste dans PostgreSQL (ACID, contraintes,
+// transactions atomiques). MongoDB est réservé aux données non-financières
+// (catalogue, contenu) dans un service séparé.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountStatus {
+  PENDING_VERIFICATION // inscrit, téléphone pas encore confirmé
+  ACTIVE
+  LOCKED               // verrouillé après trop de tentatives échouées
+  SUSPENDED            // suspendu (fraude, décision manuelle)
+}
+
+enum AccountType {
+  INDIVIDUAL
+  BUSINESS
+  // Palier allégé : commerce sans registre légal (RCCM/NIF) - reçoit des
+  // paiements et des liens de paiement, mais n'a accès ni au paiement de
+  // masse ni à l'API partenaire (voir bulkPayout.service.js et
+  // payments.service.js requestTestApiKey). Approuvé automatiquement dès
+  // la soumission car aucune pièce légale à vérifier au-delà de l'identité
+  // déjà validée au KYC particulier.
+  MERCHANT
+}
+
+enum KycTier {
+  TIER_0 // téléphone vérifié seulement
+  TIER_1 // identité déclarée (sans document)
+  TIER_2 // pièce d'identité officielle vérifiée
+}
+
+enum KycReviewStatus {
+  NONE
+  PENDING   // documents soumis, en attente de revue
+  APPROVED
+  REJECTED
+}
+
+enum FaceMatchStatus {
+  NONE
+  PENDING              // en attente d'un appel au fournisseur (ou fournisseur indisponible)
+  MATCH
+  NO_MATCH
+  INCONCLUSIVE         // aucun fournisseur réel connecté - nécessite toujours une revue humaine
+}
+
+model User {
+  id            String        @id @default(uuid())
+  phone         String        @unique // format E.164, ex: +224620000000
+  passwordHash  String
+  fullName      String?
+  status        AccountStatus @default(PENDING_VERIFICATION)
+
+  // Token de notification push (Expo) - renouvelé à chaque connexion côté
+  // app, jamais bloquant si absent (l'utilisateur retombe alors sur le
+  // SMS comme filet de sécurité, voir notification.service.js).
+  pushToken     String?
+
+  // Préférences de notification (push+SMS) par catégorie - désactiver une
+  // catégorie n'efface jamais l'évènement du journal (Notification est
+  // toujours créée), ça coupe uniquement l'interruption push/SMS.
+  notifyOnTransactions    Boolean @default(true)
+  notifyOnPaymentRequests Boolean @default(true)
+
+  accountType   AccountType   @default(INDIVIDUAL)
+
+  // Déclaré à l'inscription : "Allez-vous recevoir des paiements pour des
+  // biens ou services ?" - ne bloque rien techniquement, mais sert de base
+  // documentée si le compte se comporte ensuite comme un commerce sans
+  // jamais passer en Business (voir CGU). Un "oui" ici oriente aussi
+  // l'utilisateur vers la création d'un compte Business dès l'inscription.
+  declaresCommercialUse Boolean  @default(false)
+
+  // Horodatage de l'acceptation des CGU et de la Politique de
+  // Confidentialité à l'inscription - nullable car les comptes créés
+  // avant l'introduction de ce champ n'en ont pas. Sur toute nouvelle
+  // inscription, la validation (registerSchema) exige acceptedTerms=true
+  // et ce champ est systématiquement renseigné - voir auth.service.js.
+  termsAcceptedAt DateTime?
+
+  failedLoginAttempts Int      @default(0)
+  lockedUntil         DateTime?
+
+  // Code PIN de transaction (4 ou 6 chiffres) - remplace l'OTP par SMS pour
+  // les actions sensibles fréquentes (retrait, transfert, carte...) : même
+  // niveau de hachage qu'un mot de passe (argon2), jamais en clair. Nullable
+  // car les comptes existants avant l'introduction de cette fonctionnalité
+  // n'en ont pas encore défini - ces actions restent bloquées (403) jusqu'à
+  // ce que l'utilisateur en définisse un (voir auth.service.js, setTransactionPin).
+  transactionPinHash          String?
+  transactionPinFailedAttempts Int      @default(0)
+  transactionPinLockedUntil    DateTime?
+
+  // Référence opaque pour le mode hors ligne SMS : désigne ce compte comme
+  // DESTINATAIRE dans une commande SMS ("ENVOI 50000 <référence> <otp>"),
+  // à la place de son numéro réel - jamais affichée à son propre titulaire
+  // (voir smsCommand.service.js). Générée à la volée au premier besoin
+  // (getOrCreateSmsReference), pas à l'inscription : la plupart des
+  // comptes n'en auront jamais besoin.
+  smsReference  String?       @unique
+
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  otpCodes      OtpCode[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+  kycProfile    KycProfile?
+  businessProfile BusinessProfile?
+  notifications Notification[]
+  contactMessages ContactMessage[]
+
+  @@index([status])
+}
+
+// Profil KYC pour un compte particulier (INDIVIDUAL).
+// Un compte BUSINESS n'a pas de palier progressif : il passe directement
+// par BusinessProfile, qui exige les documents dès le départ (KYB).
+model KycProfile {
+  id             String          @id @default(uuid())
+  userId         String          @unique
+  user           User            @relation(fields: [userId], references: [id])
+
+  tier           KycTier         @default(TIER_0)
+
+  // Tier 1 - déclaratif, aucun document
+  dateOfBirth    DateTime?
+
+  // Tier 2 - pièce d'identité officielle
+  idDocumentType String?         // CNI, PASSEPORT, PERMIS_CONDUIRE, CARTE_ELECTEUR
+  idDocumentNumber String?
+  idDocumentUrl  String?         // référence vers le stockage sécurisé du scan
+  reviewStatus   KycReviewStatus @default(NONE)
+  reviewedAt     DateTime?
+  reviewedBy     String?         // id d'un futur compte admin/support
+  rejectionReason String?
+
+  // Vérification par selfie - empêche qu'une pièce d'identité volée soit
+  // uploadée par quelqu'un d'autre que son titulaire. Voir
+  // faceMatch.service.js. Sans fournisseur réel connecté, le statut reste
+  // toujours INCONCLUSIVE : jamais de faux "✓ vérifié" qui n'a rien
+  // vérifié - une revue humaine reste obligatoire dans ce cas.
+  selfieUrl        String?
+  faceMatchStatus  FaceMatchStatus @default(NONE)
+  faceMatchScore   Float?
+
+  // Filtrage sanctions/PEP - calculé automatiquement à la soumission
+  // (voir sanctionsScreening.service.js), jamais de blocage automatique,
+  // toujours une revue humaine avant toute décision.
+  sanctionsHit     Boolean       @default(false)
+  sanctionsDetails Json?
+
+  updatedAt      DateTime        @updatedAt
+  createdAt      DateTime        @default(now())
+}
+
+// Profil KYB pour un compte BUSINESS (écoles, cliniques, commerçants...) ou
+// le dossier allégé d'un compte MERCHANT. Les champs légaux sont optionnels
+// au niveau du schéma car un compte MERCHANT ne les fournit jamais - c'est
+// submitBusinessKyc() (Entreprise) qui les exige réellement à la soumission,
+// pas la base de données.
+model BusinessProfile {
+  id                    String          @id @default(uuid())
+  userId                String          @unique
+  user                  User            @relation(fields: [userId], references: [id])
+
+  businessName          String
+  rccmNumber            String?         // registre de commerce - Entreprise uniquement
+  nifNumber             String?         // numéro d'identification fiscale - Entreprise uniquement
+  legalRepName          String?
+  legalRepIdDocumentUrl String?
+  businessDocumentUrl   String?         // ex: attestation RCCM scannée - Entreprise uniquement
+
+  reviewStatus          KycReviewStatus @default(PENDING)
+  reviewedAt            DateTime?
+  reviewedBy            String?
+  rejectionReason       String?
+
+  // Filtrage sanctions/PEP sur le nom de l'entreprise ET du représentant
+  // légal - voir sanctionsScreening.service.js.
+  sanctionsHit          Boolean         @default(false)
+  sanctionsDetails      Json?
+
+  // Limite mensuelle négociée au-delà du plafond standard Business,
+  // pour les grosses institutions (null = plafond standard par défaut).
+  customMonthlyLimit    Decimal?        @db.Decimal(18, 2)
+
+  // Plafond de solde négocié au-delà du standard Business (null = standard).
+  customMaxBalance      Decimal?        @db.Decimal(18, 2)
+
+  // Taux de commission négocié (ex: 0.012 pour 1.2%). null = taux
+  // standard de la plateforme (voir src/config/fees.js).
+  feeRateOverride       Decimal?        @db.Decimal(5, 4)
+
+  // Personnalisation du reçu remis au payeur après chaque paiement -
+  // chaque institution garde son identité propre sur ses reçus plutôt
+  // qu'un ticket FlexPay générique indifférencié.
+  receiptLogoUrl        String?
+  receiptFooterText     String?
+  // Ligne de contact affichée sur le reçu (téléphone et/ou email) -
+  // distincte du pied de page libre, pour qu'un payeur sache toujours
+  // comment joindre l'institution sans avoir à le deviner dans le texte.
+  receiptContactInfo    String?
+
+  // Affichées dans le catalogue public des marchands (voir
+  // merchants.service.js) - optionnelles, collectées à la soumission KYB.
+  category              String?
+  location              String?
+
+  updatedAt             DateTime        @updatedAt
+  createdAt              DateTime        @default(now())
+
+  ubos                  BusinessUBO[]
+  paymentFields         BusinessPaymentField[]
+  paymentLinks          PaymentLink[]
+}
+
+// Lien de paiement partageable (réseaux sociaux, WhatsApp...) pour les
+// marchands sans app ni site web. Le "code" est l'identifiant public
+// opaque dans l'URL - jamais l'id interne, pour ne rien révéler sur le
+// volume de liens créés par une institution. Réutilisable par défaut
+// (plusieurs acheteurs différents paient le même lien pour le même
+// produit), contrairement à un lien de facture à usage unique.
+model PaymentLink {
+  id                    String          @id @default(uuid())
+  code                  String          @unique
+  businessProfileId     String
+  businessProfile       BusinessProfile @relation(fields: [businessProfileId], references: [id])
+
+  label                 String          // ce que le lien vend, affiché au payeur (ex: "Robe wax - Taille M")
+  amount                Decimal?        @db.Decimal(18, 2) // null = montant libre choisi par le payeur
+
+  active                Boolean         @default(true)
+  expiresAt             DateTime?
+
+  paymentCount          Int             @default(0) // compteur dénormalisé, pour l'affichage marchand
+
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+
+  @@index([businessProfileId])
+}
+
+// Champ personnalisé qu'une institution définit elle-même pour ses
+// paiements (ex: une école ajoute "Nom de l'élève" et "Classe", une
+// clinique ajoute "Numéro de dossier patient"). Jamais une liste figée
+// côté FlexPay : chaque institution compose son propre formulaire de
+// paiement selon son propre métier.
+model BusinessPaymentField {
+  id                    String          @id @default(uuid())
+  businessProfileId     String
+  businessProfile       BusinessProfile @relation(fields: [businessProfileId], references: [id])
+
+  label                 String          // ex: "Nom de l'élève" - affiché au payeur
+  fieldKey              String          // ex: "nom_de_leleve" - clé technique dérivée du label
+  required              Boolean         @default(true)
+  order                 Int             @default(0)
+
+  createdAt             DateTime        @default(now())
+
+  @@unique([businessProfileId, fieldKey])
+  @@index([businessProfileId])
+}
+
+// Bénéficiaires effectifs (Ultimate Beneficial Owners) - toute personne
+// physique qui possède ou contrôle réellement l'entreprise, pas
+// nécessairement son représentant légal. Exigence AML standard : sans ça,
+// une entreprise pourrait servir de façade à quelqu'un qui reste
+// totalement invisible du système. Au moins un UBO est exigé à la
+// soumission KYB - une entreprise sans aucun propriétaire déclaré n'a pas
+// de sens.
+model BusinessUBO {
+  id                    String          @id @default(uuid())
+  businessProfileId     String
+  businessProfile       BusinessProfile @relation(fields: [businessProfileId], references: [id])
+
+  fullName              String
+  ownershipPercentage   Decimal         @db.Decimal(5, 2) // ex: 35.50 pour 35,5%
+  idDocumentUrl         String
+
+  sanctionsHit          Boolean         @default(false)
+  sanctionsDetails      Json?
+
+  createdAt             DateTime        @default(now())
+
+  @@index([businessProfileId])
+}
+
+enum OtpPurpose {
+  PHONE_VERIFICATION
+  LOGIN_2FA
+  SENSITIVE_ACTION // retrait, ajout de source de paiement, etc.
+  PASSWORD_RESET
+  SMS_COMMAND // authentifie CHAQUE commande du mode hors ligne SMS - voir smsCommand.service.js
+}
+
+model OtpCode {
+  id         String     @id @default(uuid())
+  userId     String
+  user       User       @relation(fields: [userId], references: [id])
+  codeHash   String     // le code OTP n'est jamais stocké en clair
+  purpose    OtpPurpose
+  attempts   Int        @default(0)
+  consumedAt DateTime?
+  expiresAt  DateTime
+  createdAt  DateTime   @default(now())
+
+  @@index([userId, purpose])
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  tokenHash  String    @unique // le refresh token n'est jamais stocké en clair
+  revokedAt  DateTime?
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  userAgent  String?
+  ipAddress  String?
+
+  @@index([userId])
+}
+
+// Journal d'audit immuable — jamais de UPDATE ni DELETE applicatif sur cette table.
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String   // ex: "LOGIN_SUCCESS", "LOGIN_FAILED", "OTP_VERIFIED"
+  metadata  Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, action])
+}
+
+// ============================================================
+// WALLET / LEDGER — coeur financier de FlexPay
+// ============================================================
+//
+// Principe : partie double systématique. Chaque Transaction produit
+// TOUJOURS au moins deux LedgerEntry (un débit, un crédit) dont la somme
+// vaut zéro. Les mouvements avec l'extérieur (dépôt Mobile Money, retrait)
+// utilisent un SystemWallet comme contrepartie, pour que même ces
+// opérations restent équilibrées dans le grand livre. C'est ce qui permet
+// de recalculer un solde uniquement à partir de l'historique et de détecter
+// toute incohérence.
+
+enum WalletOwnerType {
+  USER
+  SYSTEM
+}
+
+enum SystemWalletKind {
+  EXTERNAL_MOBILE_MONEY // contrepartie des dépôts/retraits Orange Money, Areeba...
+  EXTERNAL_BANK         // contrepartie des mouvements bancaires
+  FEES_COLLECTED        // revenus de commission FlexPay
+  EXTERNAL_CARD_PROVIDER // contrepartie des rechargements de carte virtuelle
+}
+
+model Wallet {
+  id           String          @id @default(uuid())
+  ownerType    WalletOwnerType
+  userId       String?         @unique // rempli si ownerType = USER
+  systemKind   SystemWalletKind? @unique // rempli si ownerType = SYSTEM
+
+  // Solde mis en cache pour la lecture rapide - toujours mis à jour dans
+  // la même transaction DB que les LedgerEntry correspondantes, jamais
+  // modifié seul. La source de vérité reste la somme des LedgerEntry.
+  balance      Decimal         @default(0) @db.Decimal(18, 2)
+  currency     String          @default("GNF")
+  frozen       Boolean         @default(false)
+
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  ledgerEntries LedgerEntry[]
+
+  @@index([ownerType])
+}
+
+enum TransactionType {
+  DEPOSIT           // argent externe -> wallet utilisateur
+  WITHDRAWAL        // wallet utilisateur -> argent externe
+  TRANSFER          // wallet utilisateur -> wallet utilisateur
+  MERCHANT_PAYMENT  // wallet utilisateur -> wallet marchand/institution
+  FEE               // prélèvement de commission FlexPay
+  CARD_TOPUP        // wallet utilisateur -> carte virtuelle
+  REFUND            // remboursement d'une transaction précédente (toujours initié par un admin)
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+model Transaction {
+  id              String            @id @default(uuid())
+  type            TransactionType
+  status          TransactionStatus @default(PENDING)
+
+  // Clé fournie par le client (app mobile) pour garantir qu'un même appel
+  // rejoué (perte réseau, double-clic) n'est jamais traité deux fois.
+  idempotencyKey  String            @unique
+
+  initiatedByUserId String?
+  amount          Decimal           @db.Decimal(18, 2)
+  currency        String            @default("GNF")
+
+  metadata        Json?             // ex: { "provider": "orange_money", "reference": "..." }
+
+  // Si cette transaction est le remboursement d'une autre, référence
+  // vers l'originale - jamais l'inverse (l'originale ne pointe pas vers
+  // son remboursement, on le retrouve par cette colonne). Une simple
+  // référence String, pas une relation Prisma formelle, cohérent avec le
+  // reste du schéma (voir initiatedByUserId).
+  reversalOfTransactionId String?
+
+  createdAt       DateTime          @default(now())
+  completedAt     DateTime?
+
+  ledgerEntries   LedgerEntry[]
+
+  @@index([initiatedByUserId])
+  @@index([status])
+  @@index([reversalOfTransactionId])
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+// Immuable : une fois créée, une LedgerEntry n'est JAMAIS modifiée ni
+// supprimée. Une correction se fait par une nouvelle Transaction de
+// contre-passation (type REVERSED sur la Transaction d'origine), jamais
+// par une édition rétroactive.
+model LedgerEntry {
+  id            String          @id @default(uuid())
+  transactionId String
+  transaction   Transaction     @relation(fields: [transactionId], references: [id])
+  walletId      String
+  wallet        Wallet          @relation(fields: [walletId], references: [id])
+  direction     LedgerDirection
+  amount        Decimal         @db.Decimal(18, 2)
+  balanceAfter  Decimal         @db.Decimal(18, 2) // solde du wallet juste après cette écriture
+  createdAt     DateTime        @default(now())
+
+  @@index([walletId, createdAt])
+  @@index([transactionId])
+}
+
+// ============================================================
+// API B2B — agrégateur de paiement pour entreprises tierces
+// ============================================================
+// Chaque partenaire (MarketConnect, ou toute autre entreprise) est
+// rattaché à son propre compte Business (pour recevoir les fonds côté
+// FlexPay), et reçoit une clé API distincte pour ses appels serveur à
+// serveur - jamais le JWT d'un utilisateur final.
+
+enum ApiClientStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum ApiEnvironment {
+  LIVE // touche de vrais wallets, vraies transactions
+  TEST // aucune donnée financière réelle n'est jamais créée - voir paymentIntent.service.js
+}
+
+model ApiClient {
+  id              String          @id @default(uuid())
+  name            String          // ex: "MarketConnect"
+  businessUserId  String          // compte Business (User.id) qui reçoit les fonds
+  apiKeyHash      String          @unique // la clé brute n'est jamais stockée
+  apiKeyPrefix    String          // ex: "fp_live_8f2a" - affiché pour identification, jamais la clé complète
+  environment     ApiEnvironment  @default(LIVE)
+  status          ApiClientStatus @default(ACTIVE)
+
+  // Webhooks - configurés en libre-service par l'entreprise elle-même
+  // (pas besoin de repasser par l'admin pour changer son URL). Le secret
+  // est stocké CHIFFRÉ (AES-256-GCM, voir src/utils/encryption.js), pas
+  // haché : il doit être réutilisé pour signer CHAQUE webhook envoyé,
+  // contrairement à un mot de passe où seule une comparaison est
+  // nécessaire (un hachage ne se déchiffre jamais). Déchiffré à la volée
+  // dans webhook.service.js au moment de signer. Affiché en clair au
+  // partenaire une seule fois, à sa création/régénération - voir
+  // payments.service.js.
+  webhookUrl      String?
+  webhookSecret   String?
+
+  // Moyens de paiement EXTERNES (sans compte FlexPay) que ce partenaire
+  // choisit d'activer dans son propre checkout - 'orange_money', 'mtn_momo',
+  // 'card'. FlexPay lui-même n'y figure jamais : il reste toujours
+  // disponible pour tout partenaire, ce n'est pas une option qu'on
+  // désactive (voir paymentIntent.service.collectIntentExternally, qui
+  // vérifie que le moyen choisi par le client final figure bien dans
+  // cette liste avant d'accepter la collecte).
+  enabledExternalMethods String[]   @default([])
+
+  // Durcissement sécurité clé API :
+  // - expiresAt : null = n'expire jamais (comportement historique
+  //   préservé) ; au-delà, la clé est refusée même si non révoquée.
+  // - allowedIps : vide = aucune restriction ; sinon, seules ces adresses
+  //   peuvent authentifier avec cette clé (utile pour un partenaire dont
+  //   les appels sortent toujours du même serveur).
+  // - lastUsedAt : jamais mis à jour de façon bloquante (voir
+  //   requireApiKey.js) - sert à repérer une clé compromise (pic d'usage
+  //   inhabituel) ou une clé "zombie" jamais utilisée depuis sa création.
+  expiresAt       DateTime?
+  allowedIps      String[]        @default([])
+  lastUsedAt      DateTime?
+
+  createdAt       DateTime        @default(now())
+  revokedAt       DateTime?
+
+  paymentIntents  PaymentIntent[]
+  payouts         ApiPayout[]
+  webhookDeliveries WebhookDelivery[]
+
+  @@index([businessUserId])
+}
+
+enum PaymentIntentStatus {
+  PENDING_APPROVAL // créé par le partenaire, en attente que le payeur confirme dans l'app
+  APPROVED         // confirmé, fonds transférés
+  REJECTED         // refusé explicitement par le payeur
+  EXPIRED          // non traité avant expiresAt
+  CANCELLED        // annulée par le partenaire lui-même avant toute réponse du payeur
+}
+
+// Un partenaire (MarketConnect...) ne débite JAMAIS directement un
+// utilisateur via sa clé API. Il crée une "intention de paiement" ; c'est
+// l'utilisateur, connecté dans l'app FlexPay avec son propre JWT + OTP,
+// qui déclenche le mouvement de fonds en l'approuvant. La clé API d'un
+// partenaire ne donne donc jamais, à elle seule, le pouvoir de débiter
+// qui que ce soit.
+model PaymentIntent {
+  id             String              @id @default(uuid())
+  apiClientId    String
+  apiClient      ApiClient           @relation(fields: [apiClientId], references: [id])
+
+  environment    ApiEnvironment      @default(LIVE)
+
+  // Optionnel : en mode TEST, aucun utilisateur réel n'est requis, on
+  // accepte n'importe quel numéro fourni par le partenaire pour ses
+  // tests. Le numéro est toujours stocké (payerPhone), même en LIVE, pour
+  // affichage - payerUserId reste la référence faisant foi en LIVE.
+  payerUserId    String?
+  payerPhone     String
+  amount         Decimal             @db.Decimal(18, 2)
+  reference      String?
+  idempotencyKey String              @unique // fourni par le partenaire
+
+  status         PaymentIntentStatus @default(PENDING_APPROVAL)
+  transactionId  String?             // renseigné une fois APPROVED et exécuté (préfixé "test_" en mode TEST, jamais une vraie transaction)
+
+  createdAt      DateTime            @default(now())
+  expiresAt      DateTime
+  resolvedAt     DateTime?
+
+  @@index([payerUserId, status])
+  @@index([apiClientId])
+}
+
+// ============================================================
+// CARTE VIRTUELLE
+// ============================================================
+// Fournisseur d'émission volontairement non figé (voir
+// src/modules/virtualCard/providers/) - `provider` et `providerCardId`
+// permettent de brancher n'importe quel émetteur plus tard sans migration
+// de schéma. Accessible uniquement aux comptes en Tier 2 (pièce
+// d'identité vérifiée) : c'est un service qui touche à l'international,
+// le niveau de vérification le plus élevé s'applique.
+
+enum VirtualCardStatus {
+  PENDING_ISSUANCE
+  ACTIVE
+  FROZEN
+  CLOSED
+}
+
+model VirtualCard {
+  id             String            @id @default(uuid())
+  userId         String            @unique // une carte par utilisateur pour l'instant
+
+  provider       String            // ex: "mock" en dev - à remplacer par le vrai émetteur choisi
+  providerCardId String?           // référence chez le fournisseur, une fois émise
+
+  maskedNumber   String?           // ex: "**** **** **** 4242" - jamais le PAN complet stocké ici
+  currency       String            @default("USD")
+  balance        Decimal           @default(0) @db.Decimal(18, 2) // solde en devise carte, mis en cache
+
+  status         VirtualCardStatus @default(PENDING_ISSUANCE)
+
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+}
+
+// ============================================================
+// ADMIN / BACK-OFFICE
+// ============================================================
+// Authentification totalement séparée des comptes clients (User) : même
+// base de données, mais aucun chevauchement de table, de secret JWT ni
+// de logique - un bug dans le flux client ne peut jamais accidentellement
+// donner un accès admin, et inversement.
+
+enum AdminRole {
+  SUPPORT     // consultation, gestion basique (annulation d'intentions expirées...)
+  COMPLIANCE  // validation KYC/KYB
+  SUPERADMIN  // tout, y compris la création de partenaires API
+}
+
+enum AdminStatus {
+  ACTIVE
+  DISABLED
+}
+
+model AdminUser {
+  id           String      @id @default(uuid())
+  email        String      @unique
+  passwordHash String
+  fullName     String
+  role         AdminRole
+  status       AdminStatus @default(ACTIVE)
+
+  // 2FA (TOTP) - obligatoire pour tout compte admin, jamais optionnel : ce
+  // sont les comptes les plus sensibles du système (approbation KYC,
+  // création de clés API, remboursements). totpSecret est renseigné dès
+  // la première connexion (setup forcé) mais totpEnabled ne passe à true
+  // qu'une fois le premier code confirmé - avant ça, le compte reste
+  // bloqué en état "configuration requise", jamais utilisable sans 2FA.
+  totpSecret   String?
+  totpEnabled  Boolean     @default(false)
+
+  createdAt    DateTime    @default(now())
+  lastLoginAt  DateTime?
+}
+
+// ============================================================
+// PAIEMENT EN MASSE
+// ============================================================
+// Un compte Business (PME, ONG, association) paie plusieurs bénéficiaires
+// en une seule opération - typiquement des salaires. Chaque ligne est un
+// virement indépendant (wallet.service.moveFunds, type TRANSFER) : si un
+// bénéficiaire échoue (numéro non inscrit, etc.), les autres lignes ne
+// sont jamais bloquées.
+
+enum BulkPayoutStatus {
+  PROCESSING
+  COMPLETED         // toutes les lignes ont réussi
+  PARTIALLY_FAILED  // au moins une ligne a échoué
+  FAILED            // aucune ligne n'a pu être traitée
+}
+
+enum BulkPayoutItemStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model BulkPayout {
+  id             String           @id @default(uuid())
+  initiatedByUserId String        // compte Business à l'origine du paiement
+  reference      String?          // ex: "Salaires - Avril 2026"
+  idempotencyKey String           @unique
+
+  totalAmount    Decimal          @db.Decimal(18, 2)
+  successCount   Int              @default(0)
+  failedCount    Int              @default(0)
+  status         BulkPayoutStatus @default(PROCESSING)
+
+  createdAt      DateTime         @default(now())
+  completedAt    DateTime?
+
+  items          BulkPayoutItem[]
+
+  @@index([initiatedByUserId])
+}
+
+model BulkPayoutItem {
+  id              String                @id @default(uuid())
+  bulkPayoutId    String
+  bulkPayout      BulkPayout            @relation(fields: [bulkPayoutId], references: [id])
+
+  recipientPhone  String
+  recipientUserId String?               // rempli si le numéro correspond à un utilisateur FlexPay
+  amount          Decimal               @db.Decimal(18, 2)
+  reference       String?
+
+  status          BulkPayoutItemStatus  @default(PENDING)
+  transactionId   String?               // renseigné si SUCCESS
+  failureReason   String?               // renseigné si FAILED
+
+  // null = envoyé sur le wallet FlexPay du bénéficiaire (cas normal).
+  // Renseigné ('orange_money'/'mtn_momo'/'card') si le bénéficiaire n'avait
+  // pas de compte FlexPay actif et que l'entreprise a autorisé un repli
+  // externe pour ce lot (voir bulkPayout.service.createBulkPayout).
+  payoutChannel   String?
+
+  createdAt       DateTime              @default(now())
+
+  @@index([bulkPayoutId])
+}
+
+// Listes de bénéficiaires réutilisables (ex: "Employés École Sainte
+// Marie") - évite de ressaisir les mêmes personnes à chaque paie. Une
+// resoumission (updateGroup) remplace intégralement les membres, même
+// principe que pour les UBO : la liste reflète l'état actuel réel, pas
+// un historique cumulé.
+model BeneficiaryGroup {
+  id             String                   @id @default(uuid())
+  businessUserId String
+  name           String
+
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+
+  members        BeneficiaryGroupMember[]
+  perDiemSchedules PerDiemSchedule[]
+
+  @@index([businessUserId])
+}
+
+model BeneficiaryGroupMember {
+  id               String           @id @default(uuid())
+  groupId          String
+  group            BeneficiaryGroup @relation(fields: [groupId], references: [id])
+
+  label            String?          // ex: "Jean Kamano - Enseignant" - purement informatif
+  phone            String
+  defaultAmount    Decimal?         @db.Decimal(18, 2) // pré-rempli mais toujours modifiable au moment du paiement
+  defaultReference String?
+
+  createdAt        DateTime         @default(now())
+
+  @@index([groupId])
+}
+
+enum PerDiemFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+// "Paiement automatique du personnel" côté app - le per diem/frais de
+// mission classique des agents de terrain, mais envoyé tout seul chaque
+// jour (par défaut) sans que l'entreprise ait à relancer un paiement en
+// masse manuellement. Un seul schedule par entreprise pour la V1 - pas
+// plusieurs équipes à horaires différents, pour garder la configuration
+// simple à comprendre. Réutilise le même moteur que le paiement en masse
+// manuel (createBulkPayout) et le même tarif (DEFAULT_BULK_PAYOUT_FEE_RATE) -
+// ce n'est qu'une couche de programmation par-dessus, pas un flux d'argent
+// différent.
+model PerDiemSchedule {
+  id             String            @id @default(uuid())
+  businessUserId String            @unique
+
+  enabled        Boolean           @default(false)
+  groupId        String?
+  group          BeneficiaryGroup? @relation(fields: [groupId], references: [id])
+
+  frequency      PerDiemFrequency  @default(DAILY)
+  timeOfDay      String            @default("07:00") // HH:mm, heure du serveur
+  dayOfWeek      Int?              // 0=dimanche...6=samedi - utilisé seulement si WEEKLY
+  dayOfMonth     Int?              // 1-31 - utilisé seulement si MONTHLY
+
+  // null = FlexPay uniquement (comportement par défaut : une ligne sans
+  // compte FlexPay échoue, exactement comme un paiement en masse manuel
+  // sans repli choisi). Renseigné = ce moyen sert de repli pour les
+  // bénéficiaires sans compte FlexPay, FlexPay reste toujours tenté en
+  // premier pour ceux qui en ont un.
+  externalPayoutMethod String?
+
+  reference      String?           // libellé des lots générés, ex: "Per diem agents terrain"
+
+  lastRunAt      DateTime?
+  lastRunStatus  String?           // résumé du dernier passage, pour affichage simple
+  lastRunBulkPayoutId String?
+
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+}
+
+// ============================================================
+// LISTE DE VIGILANCE (sanctions / personnes politiquement exposées)
+// ============================================================
+// ⚠️ Table volontairement vide au départ, à alimenter avec une vraie
+// source de données avant toute mise en production (listes OFAC/SDN,
+// ONU, UE, ou un fournisseur spécialisé comme ComplyAdvantage/Refinitiv
+// World-Check). Ce système fournit l'architecture de filtrage
+// (correspondance floue, revue admin) - PAS les données elles-mêmes.
+// Voir scripts/seed-sanctions-test-data.js pour des entrées FICTIVES
+// utilisées uniquement en test.
+
+enum WatchlistType {
+  SANCTIONS
+  PEP // Personne Politiquement Exposée
+}
+
+model SanctionedEntity {
+  id        String        @id @default(uuid())
+  fullName  String
+  aliases   String[]      @default([])
+  type      WatchlistType
+  source    String        // ex: "OFAC-SDN", "UE", "Test fictif"
+  createdAt DateTime      @default(now())
+
+  @@index([fullName])
+}
+
+// ============================================================
+// FICHIERS (pièces d'identité, documents KYB...)
+// ============================================================
+// Fournisseur de stockage volontairement non figé (voir
+// src/modules/files/storage/) - `storageKey` permet de brancher n'importe
+// quel backend (disque local en dev, S3-compatible en prod) sans
+// migration de schéma. Chaque fichier a un propriétaire explicite : c'est
+// ce qui empêche un utilisateur de récupérer la pièce d'identité de
+// quelqu'un d'autre en devinant une URL.
+
+enum FilePurpose {
+  KYC_ID_DOCUMENT
+  KYC_SELFIE
+  KYB_LEGAL_REP_ID
+  KYB_BUSINESS_DOCUMENT
+  KYB_UBO_ID_DOCUMENT
+  BUSINESS_RECEIPT_LOGO
+}
+
+model FileAsset {
+  id           String      @id @default(uuid())
+  ownerUserId  String
+  purpose      FilePurpose
+  storageKey   String      @unique // référence interne au backend de stockage
+  mimeType     String
+  sizeBytes    Int          // taille du fichier d'ORIGINE (pas du blob chiffré, plus grand de 28 octets - iv+authTag)
+
+  // Faux par défaut (donc faux pour toute ligne déjà en base avant ce
+  // champ) : permet à scripts/encrypt-existing-files.js de retrouver
+  // précisément les fichiers écrits en clair avant l'introduction du
+  // chiffrement, sans dépendre d'une détection par contenu (impossible à
+  // faire fiablement sur du binaire). uploadFile() le met à true pour
+  // tout nouvel upload - voir files.service.js.
+  encryptedAtRest Boolean   @default(false)
+
+  createdAt    DateTime    @default(now())
+
+  @@index([ownerUserId])
+}
+
+// ============================================================
+// NOTIFICATIONS (journal consultable, distinct du simple envoi push/SMS)
+// ============================================================
+// Créée systématiquement à chaque évènement notifiable, même si
+// l'utilisateur a désactivé la catégorie correspondante dans ses
+// préférences - désactiver le push ne doit jamais faire disparaître
+// l'évènement de son historique consultable dans l'app.
+
+enum NotificationType {
+  DEPOSIT_RECEIVED
+  WITHDRAWAL_COMPLETED
+  TRANSFER_SENT
+  TRANSFER_RECEIVED
+  PAYMENT_SENT
+  PAYMENT_RECEIVED
+  PAYMENT_REQUEST_PENDING
+  KYC_SUBMITTED
+  KYC_APPROVED
+  KYC_REJECTED
+  KYB_SUBMITTED
+  KYB_APPROVED
+  KYB_REJECTED
+
+  // Sécurité - catégorie toujours active, jamais désactivable via les
+  // préférences (voir notification.service.js) : laisser un utilisateur
+  // couper l'alerte "quelqu'un vient de se connecter à votre compte"
+  // viderait ces notifications de leur utilité.
+  NEW_LOGIN
+  PASSWORD_CHANGED
+  ACCOUNT_LOCKED
+  TRANSACTION_PIN_CHANGED
+  TRANSACTION_PIN_LOCKED
+
+  VIRTUAL_CARD_ISSUED
+  VIRTUAL_CARD_TOPUP
+  VIRTUAL_CARD_FROZEN
+  VIRTUAL_CARD_UNFROZEN
+
+  BULK_PAYOUT_COMPLETED
+  REFUND_RECEIVED
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id])
+
+  type      NotificationType
+  title     String
+  body      String
+  data      Json?            // ex: { transactionId, amount, businessName }
+
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// ============================================================
+// API PAY-OUT (versement déclenché par un partenaire vers un utilisateur)
+// ============================================================
+// Symétrique du PaymentIntent (pay-in) mais dans l'autre sens : ici c'est
+// le partenaire qui pousse de l'argent VERS un utilisateur (rembourser un
+// client, payer un livreur...), immédiatement et sans approbation du
+// bénéficiaire - recevoir de l'argent ne demande jamais de confirmation,
+// contrairement à en payer. Les fonds sortent du wallet FlexPay du
+// compte Business associé à la clé API (ApiClient.businessUserId), comme
+// pour le paiement en masse déclenché depuis le tableau de bord.
+enum ApiPayoutStatus {
+  COMPLETED
+  FAILED // uniquement atteignable en TEST via forceOutcome - en LIVE, un échec lève une erreur avant toute création
+}
+
+model ApiPayout {
+  id              String          @id @default(uuid())
+  apiClientId     String
+  apiClient       ApiClient       @relation(fields: [apiClientId], references: [id])
+  environment     ApiEnvironment
+
+  recipientPhone  String
+  recipientUserId String?         // null en TEST (aucun utilisateur réel requis)
+  amount          Decimal         @db.Decimal(18, 2)
+  reference       String?
+  idempotencyKey  String          @unique
+
+  status          ApiPayoutStatus
+  transactionId   String?         // préfixé test_ en environnement TEST
+  failureReason   String?
+
+  createdAt       DateTime        @default(now())
+  completedAt     DateTime?
+
+  @@index([apiClientId])
+}
+
+// ============================================================
+// FIABILITÉ DES WEBHOOKS (file de réessai)
+// ============================================================
+// Corrige la limite documentée dans webhook.service.js : un échec de
+// livraison n'est plus définitivement perdu. Chaque tentative (succès ou
+// échec) est journalisée ; un échec programme un nouveau réessai à
+// backoff croissant (voir WEBHOOK_RETRY_DELAYS_MS), jusqu'à
+// MAX_WEBHOOK_ATTEMPTS où la livraison est abandonnée mais reste
+// consultable par le partenaire (GET /payments/api/webhook-deliveries).
+enum WebhookDeliveryStatus {
+  PENDING     // livrée avec succès pas encore confirmée, ou en attente du prochain réessai
+  DELIVERED
+  FAILED      // nombre maximal de tentatives atteint, abandonné
+}
+
+model WebhookDelivery {
+  id          String                @id @default(uuid())
+  apiClientId String
+  apiClient   ApiClient             @relation(fields: [apiClientId], references: [id])
+
+  event       String
+  payload     Json
+  status      WebhookDeliveryStatus @default(PENDING)
+  attempts    Int                   @default(0)
+  lastError   String?
+  nextRetryAt DateTime?
+
+  createdAt   DateTime              @default(now())
+  deliveredAt DateTime?
+
+  @@index([apiClientId, createdAt])
+  @@index([status, nextRetryAt])
+}
+
+// ============================================================
+// CONTACT / SUPPORT
+// ============================================================
+// Volontairement accessible sans compte - le site vitrine doit pouvoir
+// recevoir un message d'un visiteur qui n'a pas encore ouvert de compte.
+// userId est donc optionnel : rempli automatiquement depuis l'app quand
+// l'utilisateur est connecté, laissé vide depuis le site public.
+enum ContactMessageStatus {
+  NEW
+  READ
+}
+
+model ContactMessage {
+  id          String               @id @default(uuid())
+  userId      String?
+  user        User?                @relation(fields: [userId], references: [id])
+
+  fullName    String
+  contactInfo String               // email ou téléphone, au choix de l'expéditeur
+  subject     String
+  message     String
+  source      String               // "landing" | "app" - origine du message
+
+  status      ContactMessageStatus @default(NEW)
+  createdAt   DateTime             @default(now())
+
+  @@index([createdAt])
+}
